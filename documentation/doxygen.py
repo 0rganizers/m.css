@@ -623,6 +623,9 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
             if not element.tag == 'simplesect':
                 id = extract_id_hash(state, element)
                 title = html.escape(i.text)
+                if "<tt>" in i.text:
+                    title = title.replace("&lt;tt&gt;", "<code>")
+                    title = title.replace("&lt;/tt&gt;", "</code>")
 
                 # Populate section info for top-level desc
                 if state.parsing_toplevel_desc:
