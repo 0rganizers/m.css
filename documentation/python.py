@@ -3,7 +3,8 @@
 #
 #   This file is part of m.css.
 #
-#   Copyright © 2017, 2018, 2019, 2020 Vladimír Vondruš <mosra@centrum.cz>
+#   Copyright © 2017, 2018, 2019, 2020, 2021, 2022
+#             Vladimír Vondruš <mosra@centrum.cz>
 #   Copyright © 2020 Sergei Izmailov <sergei.a.izmailov@gmail.com>
 #
 #   Permission is hereby granted, free of charge, to any person obtaining a
@@ -54,7 +55,7 @@ from docutils.transforms import Transform
 
 import jinja2
 
-from _search import CssClass, ResultFlag, ResultMap, Trie, serialize_search_data, base85encode_search_data, searchdata_format_version, search_filename, searchdata_filename, searchdata_filename_b85
+from _search import CssClass, ResultFlag, ResultMap, Trie, Serializer, serialize_search_data, base85encode_search_data, searchdata_format_version, search_filename, searchdata_filename, searchdata_filename_b85
 
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '../plugins'))
 import m.htmlsanity
@@ -172,6 +173,9 @@ default_config = {
     'SEARCH_DISABLED': False,
     'SEARCH_DOWNLOAD_BINARY': False,
     'SEARCH_FILENAME_PREFIX': 'searchdata',
+    'SEARCH_RESULT_ID_BYTES': 2,
+    'SEARCH_FILE_OFFSET_BYTES': 3,
+    'SEARCH_NAME_SIZE_BYTES': 1,
     'SEARCH_HELP': """.. raw:: html
 
     <p class="m-noindent">Search for modules, classes, functions and other
@@ -969,34 +973,38 @@ def parse_pybind_signature(state: State, referrer_path: List[str], signature: st
         end = original_signature.find('\n')
         logging.warning("cannot parse pybind11 function signature %s: %s", (original_signature[:end if end != -1 else None]), e)
         if end != -1 and len(original_signature) > end + 1 and original_signature[end + 1] == '\n':
-            summary = inspect.cleandoc(original_signature[end + 1:]).partition('\n\n')[0]
+            docstring = inspect.cleandoc(original_signature[end + 1:])
         else:
-            summary = ''
-        return (name, summary, [('…', None, None, None)], None, None)
+            docstring = ''
+        return (name, docstring, [('…', None, None, None)], None, None)
 
     if len(signature) > 1 and signature[1] == '\n':
-        summary = inspect.cleandoc(signature[2:]).partition('\n\n')[0]
+        docstring = inspect.cleandoc(signature[2:])
     else:
-        summary = ''
+        docstring = ''
 
-    return (name, summary, args, return_type, return_type_link)
+    return (name, docstring, args, return_type, return_type_link)
 
 def parse_pybind_docstring(state: State, referrer_path: List[str], doc: str) -> List[Tuple[str, str, List[Tuple[str, str, str]], str]]:
     name = referrer_path[-1]
 
-    # Multiple overloads, parse each separately
-    overload_header = "{}(*args, **kwargs)\nOverloaded function.\n\n".format(name);
+    # Multiple overloads, parse each separately. It's not possible to fully
+    # prevent accidentally matching contents of the docstring as a next
+    # overload so at least expect each overload to start with two newlines and
+    # a monotonic counter number, which hopefully skips most cases where a
+    # function is referenced in the middle of a paragraph.
+    overload_header = "{}(*args, **kwargs)\nOverloaded function.".format(name);
     if doc.startswith(overload_header):
         doc = doc[len(overload_header):]
         overloads = []
         id = 1
         while True:
-            assert doc.startswith('{}. {}('.format(id, name))
+            assert doc.startswith('\n\n{}. {}('.format(id, name))
             id = id + 1
-            next = doc.find('{}. {}('.format(id, name))
+            next = doc.find('\n\n{}. {}('.format(id, name))
 
             # Parse the signature and docs from known slice
-            overloads += [parse_pybind_signature(state, referrer_path, doc[len(str(id - 1)) + 2:next])]
+            overloads += [parse_pybind_signature(state, referrer_path, doc[len(str(id - 1)) + 4:next])]
             assert overloads[-1][0] == name
             if next == -1: break
 
@@ -2450,7 +2458,7 @@ def build_search_data(state: State, merge_subtrees=True, add_lookahead_barriers=
     # order by default
     trie.sort(map)
 
-    return serialize_search_data(trie, map, search_type_map, symbol_count, merge_subtrees=merge_subtrees, merge_prefixes=merge_prefixes)
+    return serialize_search_data(Serializer(file_offset_bytes=state.config['SEARCH_FILE_OFFSET_BYTES'], result_id_bytes=state.config['SEARCH_RESULT_ID_BYTES'], name_size_bytes=state.config['SEARCH_NAME_SIZE_BYTES']), trie, map, search_type_map, symbol_count, merge_subtrees=merge_subtrees, merge_prefixes=merge_prefixes)
 
 def run(basedir, config, *, templates=default_templates, search_add_lookahead_barriers=True, search_merge_subtrees=True, search_merge_prefixes=True):
     # Populate the INPUT, if not specified, make it absolute

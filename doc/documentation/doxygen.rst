@@ -1,7 +1,8 @@
 ..
     This file is part of m.css.
 
-    Copyright © 2017, 2018, 2019, 2020 Vladimír Vondruš <mosra@centrum.cz>
+    Copyright © 2017, 2018, 2019, 2020, 2021, 2022
+              Vladimír Vondruš <mosra@centrum.cz>
 
     Permission is hereby granted, free of charge, to any person obtaining a
     copy of this software and associated documentation files (the "Software"),
@@ -390,6 +391,18 @@ Variable                            Description
                                     Python documentation shares the same
                                     directory. If not set, ``searchdata`` is
                                     used.
+:py:`SEARCH_RESULT_ID_BYTES: int`   Search data packing option. A value of
+                                    :py:`2`, :py:`3` or :py:`4` is allowed. If
+                                    not set, :py:`2` is used. See
+                                    `Search options`_ for more information.
+:py:`SEARCH_FILE_OFFSET_BYTES: int` Search data packing option. A value of
+                                    :py:`3` or :py:`4` is allowed. If not set,
+                                    :py:`3` is used. See `Search options`_ for
+                                    more information.
+:py:`SEARCH_NAME_SIZE_BYTES: int`   Search data packing option. A value of
+                                    :py:`1` or :py:`2` is allowed. If not set,
+                                    :py:`1` is used. See `Search options`_ for
+                                    more information.
 :py:`SEARCH_HELP: str`              HTML code to display as help text on empty
                                     search popup. If not set, a default message
                                     is used. Has effect only if
@@ -479,6 +492,9 @@ these are not expected to be excessively large.
     :ini:`M_SEARCH_DISABLED`            :py:`SEARCH_DISABLED`
     :ini:`M_SEARCH_DOWNLOAD_BINARY`     :py:`SEARCH_DOWNLOAD_BINARY`
     :ini:`M_SEARCH_FILENAME_PREFIX`     :py:`SEARCH_FILENAME_PREFIX`
+    :ini:`M_SEARCH_RESULT_ID_BYTES`     :py:`SEARCH_RESULT_ID_BYTES`
+    :ini:`M_SEARCH_FILE_OFFSET_BYTES`   :py:`SEARCH_FILE_OFFSET_BYTES`
+    :ini:`M_SEARCH_NAME_SIZE_BYTES`     :py:`SEARCH_NAME_SIZE_BYTES`
     :ini:`M_SEARCH_HELP`                :py:`SEARCH_HELP`
     :ini:`M_SEARCH_BASE_URL`            :py:`SEARCH_BASE_URL`
     :ini:`M_SEARCH_EXTERNAL_URL`        :py:`SEARCH_EXTERNAL_URL`
@@ -711,6 +727,22 @@ search to a subdomain:
 
     SEARCH_EXTERNAL_URL = "https://google.com/search?q=site:doc.magnum.graphics+{query}"
 
+The search binary is implicitly made with the tightest packing possible for
+smallest download sizes. On large projects with tens of thousands of symbols it
+may however happen that the data won't fit and doc generation fails with an
+exception such as the following, suggesting you to increase the packed type
+sizes:
+
+    OverflowError: Trie result ID too large to store in 16 bits, set
+    SEARCH_RESULT_ID_BYTES = 3 in your conf.py.
+
+The relevant `configuration`_ is :py:`SEARCH_RESULT_ID_BYTES`,
+:py:`SEARCH_FILE_OFFSET_BYTES` and :py:`SEARCH_NAME_SIZE_BYTES`. Simply update
+your ``conf.py`` with suggested values (or the ``Doxyfile-mcss`` with this
+option prefixed with ``M_``) and restart the generator. Due to the way the
+search data get processed during serialization it's unfortunately not feasible
+to estimate the packing sizes beforehand.
+
 `Showing undocumented symbols and files`_
 -----------------------------------------
 
@@ -830,6 +862,9 @@ theme:
 
     DOT_FONTNAME = Source Sans Pro
     DOT_FONTSIZE = 16.0
+    # Required to be explicitly set since Doxygen 1.9.2, otherwise the graphs
+    # won't be included in the output
+    HAVE_DOT = YES
 
 See documentation of the `m.dot <{filename}/plugins/plots-and-graphs.rst#graphs>`_
 plugin for detailed information about behavior and supported features.

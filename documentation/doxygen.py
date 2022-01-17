@@ -3,7 +3,8 @@
 #
 #   This file is part of m.css.
 #
-#   Copyright © 2017, 2018, 2019, 2020 Vladimír Vondruš <mosra@centrum.cz>
+#   Copyright © 2017, 2018, 2019, 2020, 2021, 2022
+#             Vladimír Vondruš <mosra@centrum.cz>
 #   Copyright © 2020 Yuri Edward <nicolas1.fraysse@epitech.eu>
 #
 #   Permission is hereby granted, free of charge, to any person obtaining a
@@ -49,7 +50,7 @@ from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import TextLexer, BashSessionLexer, get_lexer_by_name, find_lexer_class_for_filename
 
-from _search import CssClass, ResultFlag, ResultMap, Trie, serialize_search_data, base85encode_search_data, search_filename, searchdata_filename, searchdata_filename_b85, searchdata_format_version
+from _search import CssClass, ResultFlag, ResultMap, Trie, Serializer, serialize_search_data, base85encode_search_data, search_filename, searchdata_filename, searchdata_filename_b85, searchdata_format_version
 
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '../plugins'))
 import dot2svg
@@ -126,6 +127,9 @@ default_config = {
     'SEARCH_DISABLED': False,
     'SEARCH_DOWNLOAD_BINARY': False,
     'SEARCH_FILENAME_PREFIX': 'searchdata',
+    'SEARCH_RESULT_ID_BYTES': 2,
+    'SEARCH_FILE_OFFSET_BYTES': 3,
+    'SEARCH_NAME_SIZE_BYTES': 1,
     'SEARCH_HELP':
 """<p class="m-noindent">Search for symbols, directories, files, pages or
 modules. You can omit any prefix from the symbol or file path; adding a
@@ -391,6 +395,10 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
     # kind), set only if there is no i.tail, reset in the next iteration.
     previous_section = None
 
+    # So we can peek what the previous element was. Needed by Doxygen 1.9
+    # code-after-blockquote discovery.
+    previous_element = None
+
     # A CSS class to be added inline (not propagated outside of the paragraph)
     add_inline_css_class = None
 
@@ -405,7 +413,7 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
             out.params.update(parsed.params)
         if parsed.return_value:
             if out.return_value:
-                logging.warning("{}: superfluous @return section found, ignoring: {} ".format(state.current, ''.join(i.itertext())))
+                logging.warning("{}: superfluous @return section found, ignoring: {}".format(state.current, ''.join(i.itertext()).rstrip()))
             else:
                 out.return_value = parsed.return_value
         if parsed.return_values:
@@ -419,7 +427,24 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
             out.deprecated = parsed.deprecated
 
     i: ET.Element
+    # The index gets only used in <programlisting> code vs inline detection, to
+    # check if there are any elements in the block element after it. All uses
+    # of it need to take into account the <zwj/> skipping in Doxygen 1.9
+    # blockquotes below.
     for index, i in enumerate(element):
+        # As of 1.9.3 and https://github.com/doxygen/doxygen/pull/7422, a
+        # stupid &zwj; is added at the front of every Markdown blockquote for
+        # some silly reason, and then the Markdown is processed as a HTML,
+        # resulting in <blockquote><para><zwj/>. Drop the <zwj/> from there, as
+        # it's useless and messes up with our <para> patching logic.
+        if index == 0 and i.tag == 'zwj' and element.tag == 'para' and immediate_parent and immediate_parent.tag == 'blockquote':
+            if i.tail:
+                tail: str = html.escape(i.tail)
+                if trim:
+                    tail = tail.strip()
+                out.parsed += tail
+            continue
+
         # State used later
         code_block = None
         formula_block = None
@@ -442,7 +467,16 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
 
         # <programlisting> is autodetected to be either block or inline
         elif i.tag == 'programlisting':
-            element_children_count = len([listing for listing in element])
+            # In a blockquote we need to not count the initial <zwj/> added by
+            # Doxygen 1.9. Otherwise all code blocks alone in a blockquote
+            # would be treated as inline.
+            if element.tag == 'para' and immediate_parent and immediate_parent.tag == 'blockquote':
+                element_children_count = 0
+                for listing_index, listing in enumerate(element):
+                    if listing_index == 0 and listing.tag == 'zwj': continue
+                    element_children_count += 1
+            else:
+                element_children_count = len([listing for listing in element])
 
             # If it seems to be a standalone code paragraph, don't wrap it
             # in <p> and use <pre>:
@@ -457,13 +491,16 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
                 # so for @include and related, though.)
                 ('filename' in i.attrib and not i.attrib['filename'].startswith('.')) or
 
-                # or is code right after a note/attention/... section,
+                # or is
+                #   - code right after a note/attention/... section
+                #   - or in Doxygen 1.9 code right after a blockquote, which is
+                #     no longer wrapped into its own <para>,
                 # there's no text after and it's the last thing in the
                 # paragraph (Doxygen ALSO doesn't separate end of a section
                 # and begin of a code block by a paragraph even if there is
                 # a blank line. But it does so for xrefitems such as @todo.
                 # I don't even.)
-                (previous_section and (not i.tail or not i.tail.strip()) and index + 1 == element_children_count)
+                ((previous_section or (previous_element and previous_element.tag == 'blockquote')) and (not i.tail or not i.tail.strip()) and index + 1 == element_children_count)
             ):
                 code_block = True
 
@@ -811,7 +848,7 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
             # Return value is separated from the text flow
             if i.attrib['kind'] == 'return':
                 if out.return_value:
-                    logging.warning("{}: superfluous @return section found, ignoring: {} ".format(state.current, ''.join(i.itertext())))
+                    logging.warning("{}: superfluous @return section found, ignoring: {}".format(state.current, ''.join(i.itertext()).rstrip()))
                 else:
                     out.return_value = parse_desc(state, i)
 
@@ -1051,8 +1088,16 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
             caption = None
             if i.tag == 'dotfile':
                 if 'name' in i.attrib:
-                    with open(i.attrib['name'], 'r') as f:
+                    # Since 1.9.3, the file is copied to the XML output
+                    # directory and name contains its relative path. Before
+                    # that, the name was absolute, os.path.join() should do the
+                    # right thing in both cases.
+                    path = os.path.join(state.basedir, state.doxyfile['OUTPUT_DIRECTORY'], state.doxyfile['XML_OUTPUT'], i.attrib['name'])
+                    with open(path, 'r') as f:
                         source = f.read()
+                # Since 1.8.16 the whole <dotfile> tag is dropped if the file
+                # doesn't exist. Such a great solution that it's unfathomable.
+                # FFS.
                 else:
                     logging.warning("{}: file passed to @dotfile was not found, rendering an empty graph".format(state.current))
                     source = 'digraph "" {}'
@@ -1155,9 +1200,14 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
 
             # Doxygen doesn't add a space before <programlisting> if it's
             # inline, add it manually in case there should be a space before
-            # it. However, it does add a space after it always.
+            # it. However, it does add a space after it always so we don't need
+            # to.
+            #
+            # There doesn't need to be a space if it's a start of a tag, if
+            # there's already one, if there's an opening brace before or if
+            # <para> patching started a new paragraph right before.
             if not code_block:
-                if out.parsed and not out.parsed[-1].isspace() and not out.parsed[-1] in '([{':
+                if out.parsed and not out.parsed[-1].isspace() and not out.parsed[-1] in '([{' and not out.parsed.endswith('<p>'):
                     out.parsed += ' '
 
             # Hammer unhighlighted code out of the block
@@ -1650,6 +1700,10 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
                 tail = tail.lstrip()
             out.parsed += tail
 
+        # Remember the previous element. Needed by Doxygen 1.9
+        # code-after-blockquote discovery.
+        previous_element = i
+
     # A section was left open in the last iteration, close it. Expect that
     # there was nothing after that would mess with us.
     if previous_section:
@@ -1684,11 +1738,21 @@ def parse_desc_internal(state: State, element: ET.Element, immediate_parent: ET.
                 assert out.parsed.startswith('<p>') and out.parsed.endswith('</p>')
                 out.parsed = out.parsed[3:-4]
 
-        # Sane behavior otherwise
+        # Sane behavior otherwise. Well, no. I give up.
         else:
-            assert not has_block_elements and paragraph_count <= 1, \
-                "{}: brief description containing multiple paragraphs, possibly due to @ingroup following a @brief in {}. This was a bug in Doxygen 1.8.15/16 and fixed since, please upgrade.".format(state.current, out.parsed)
-            if paragraph_count == 1:
+            # In 1.8.15 if @brief is followed by an @ingroup, then the
+            # immediately following paragraph gets merged with it for some
+            # freaking reason. See the contents_brief_multiline_ingroup test
+            # for details. Fixed since 1.8.16.
+            #
+            # In 1.8.18+, if ///> is accidentally used to mark "a docblock for
+            # the following symbol", it leads to a <blockquote> contained in
+            # the brief. Not much to do except for ignoring the whole thing.
+            # See the contents_autobrief_blockquote test for details.
+            if has_block_elements or paragraph_count > 1:
+                logging.warning("{}: ignoring brief description containing multiple paragraphs. Please modify your markup to remove any block elements from the following: {}".format(state.current, out.parsed))
+                out.parsed = ''
+            elif paragraph_count == 1:
                 assert out.parsed.startswith('<p>') and out.parsed.endswith('</p>')
                 out.parsed = out.parsed[3:-4]
 
@@ -2026,7 +2090,11 @@ def parse_func(state: State, element: ET.Element):
         name = p.find('declname')
         param = Empty()
         param.name = name.text if name is not None else ''
-        param.type = parse_type(state, p.find('type'))
+        param_type = p.find('type')
+        if param_type is None:
+            logging.warning("{}: parameter {} of function {} has no type, ignoring the whole function as it's suspected to be a mishandled macro call".format(state.current, param.name, func.name))
+            return None
+        param.type = parse_type(state, param_type)
 
         # Recombine parameter name and array information back
         array = p.find('array')
@@ -2175,18 +2243,28 @@ def is_a_stupid_empty_markdown_page(compounddef: ET.Element):
     return compounddef.find('compoundname').text.startswith('md_') and compounddef.find('compoundname').text.endswith(compounddef.find('title').text) and not compounddef.find('briefdescription') and not compounddef.find('detaileddescription')
 
 def extract_metadata(state: State, xml):
-    logging.debug("Extracting metadata from {}".format(os.path.basename(xml)))
+    # parse_desc() / parse_inline_desc() is called from here, be sure to set
+    # current filename so it's reflected in possible warnings
+    state.current = os.path.basename(xml)
+
+    # These early returns should be kept consistent with parse_xml()
+    if state.current == 'Doxyfile.xml':
+        logging.debug("Ignoring {}".format(state.current))
+        return
+
+    logging.debug("Extracting metadata from {}".format(state.current))
 
     try:
         tree = ET.parse(xml)
     except ET.ParseError as e:
-        logging.error("{}: XML parse error, skipping: {}".format(os.path.basename(xml), e))
+        logging.error("{}: XML parse error, skipping whole file: {}".format(state.current, e))
         return
 
     root = tree.getroot()
 
-    # We need just list of all example files in correct order, nothing else
-    if os.path.basename(xml) == 'index.xml':
+    # From index.xml we need just list of all example files in correct order,
+    # nothing else
+    if state.current == 'index.xml':
         for i in root:
             if i.attrib['kind'] == 'example':
                 compound = Empty()
@@ -2196,10 +2274,18 @@ def extract_metadata(state: State, xml):
                 state.examples += [compound]
         return
 
-    compounddef: ET.Element = root.find('compounddef')
+    # From other files we expect <doxygen><compounddef>
+    if root.tag != 'doxygen':
+        logging.warning("{}: root element expected to be <doxygen> but is <{}>, skipping whole file".format(state.current, root.tag))
+        return
+    compounddef: ET.Element = root[0]
+    if compounddef.tag != 'compounddef':
+        logging.warning("{}: first child element expected to be <compounddef> but is <{}>, skipping whole file".format(state.current, compounddef.tag))
+        return
+    assert len([i for i in root]) == 1
 
     if compounddef.attrib['kind'] not in ['namespace', 'group', 'class', 'struct', 'union', 'dir', 'file', 'page']:
-        logging.debug("No useful info in {}, skipping".format(os.path.basename(xml)))
+        logging.debug("No useful info in {}, skipping".format(state.current))
         return
 
     # In order to show also undocumented members, go through all empty
@@ -2443,7 +2529,7 @@ def build_search_data(state: State, merge_subtrees=True, add_lookahead_barriers=
     # order by default
     trie.sort(map)
 
-    return serialize_search_data(trie, map, search_type_map, symbol_count, merge_subtrees=merge_subtrees, merge_prefixes=merge_prefixes)
+    return serialize_search_data(Serializer(file_offset_bytes=state.config['SEARCH_FILE_OFFSET_BYTES'], result_id_bytes=state.config['SEARCH_RESULT_ID_BYTES'], name_size_bytes=state.config['SEARCH_NAME_SIZE_BYTES']), trie, map, search_type_map, symbol_count, merge_subtrees=merge_subtrees, merge_prefixes=merge_prefixes)
 
 def parse_xml(state: State, xml: str):
     # Reset counter for unique math formulas
@@ -2451,19 +2537,24 @@ def parse_xml(state: State, xml: str):
 
     state.current = os.path.basename(xml)
 
+    # All these early returns were logged in extract_metadata() already, no
+    # need to print the same warnings/erorrs twice. Keep the two consistent.
+    if state.current == 'Doxyfile.html':
+        return
+
     logging.debug("Parsing {}".format(state.current))
 
     try:
         tree = ET.parse(xml)
     except ET.ParseError as e:
-        logging.error("{}: XML parse error, skipping: {}".format(state.current, e))
+        return
+    root = tree.getroot()
+    if root.tag != 'doxygen':
+        return
+    compounddef: ET.Element = root[0]
+    if compounddef.tag != 'compounddef':
         return
 
-    root = tree.getroot()
-    assert root.tag == 'doxygen'
-
-    compounddef: ET.Element = root[0]
-    assert compounddef.tag == 'compounddef'
     assert len([i for i in root]) == 1
 
     # Ignoring private structs/classes and unnamed namespaces
@@ -2984,8 +3075,9 @@ def parse_xml(state: State, xml: str):
                 for memberdef in compounddef_child:
                     # Ignore friend classes. This does not ignore friend
                     # classes written as `friend Foo;`, those are parsed as
-                    # variables (ugh).
-                    if memberdef.find('type').text in ['friend class', 'friend struct', 'friend union']:
+                    # variables (ugh). Since Doxygen 1.9 the `friend ` prefix
+                    # is omitted.
+                    if memberdef.find('type').text in ['class', 'struct', 'union', 'friend class', 'friend struct', 'friend union']:
                         # Print a warning in case these are documented
                         if (''.join(memberdef.find('briefdescription').itertext()).strip() or ''.join(memberdef.find('detaileddescription').itertext()).strip()):
                             logging.warning("{}: doxygen is unable to cross-link {}, ignoring, sorry".format(state.current, memberdef.find('definition').text))
@@ -3035,8 +3127,9 @@ def parse_xml(state: State, xml: str):
                     elif memberdef.attrib['kind'] == 'friend':
                         # Ignore friend classes. This does not ignore friend
                         # classes written as `friend Foo;`, those are parsed as
-                        # variables (ugh).
-                        if memberdef.find('type').text in ['friend class', 'friend struct', 'friend union'] and (memberdef.find('briefdescription').text or memberdef.find('detaileddescription').text):
+                        # variables (ugh). Since Doxygen 1.9 the `friend `
+                        # prefix is omitted.
+                        if memberdef.find('type').text in ['class', 'struct', 'union', 'friend class', 'friend struct', 'friend union'] and (memberdef.find('briefdescription').text or memberdef.find('detaileddescription').text):
                             logging.warning("{}: doxygen is unable to cross-link {}, ignoring, sorry".format(state.current, memberdef.find('definition').text))
                         # Only friend functions left, hopefully, parse as a func
                         else:
@@ -3513,6 +3606,9 @@ def parse_doxyfile(state: State, doxyfile, values = None):
         ('M_SEARCH_DISABLED', 'SEARCH_DISABLED', bool),
         ('M_SEARCH_DOWNLOAD_BINARY', 'SEARCH_DOWNLOAD_BINARY', bool),
         ('M_SEARCH_FILENAME_PREFIX', 'SEARCH_FILENAME_PREFIX', str),
+        ('M_SEARCH_RESULT_ID_BYTES', 'SEARCH_RESULT_ID_BYTES', int),
+        ('M_SEARCH_FILE_OFFSET_BYTES', 'SEARCH_FILE_OFFSET_BYTES', int),
+        ('M_SEARCH_NAME_SIZE_BYTES', 'SEARCH_NAME_SIZE_BYTES', int),
         ('M_SEARCH_HELP', 'SEARCH_HELP', str),
         ('M_SEARCH_BASE_URL', 'SEARCH_BASE_URL', str),
         ('M_SEARCH_EXTERNAL_URL', 'SEARCH_EXTERNAL_URL', str),

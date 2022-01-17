@@ -1,7 +1,8 @@
 #
 #   This file is part of m.css.
 #
-#   Copyright © 2017, 2018, 2019, 2020 Vladimír Vondruš <mosra@centrum.cz>
+#   Copyright © 2017, 2018, 2019, 2020, 2021, 2022
+#             Vladimír Vondruš <mosra@centrum.cz>
 #
 #   Permission is hereby granted, free of charge, to any person obtaining a
 #   copy of this software and associated documentation files (the "Software"),
@@ -390,7 +391,9 @@ class SaneHtmlTranslator(HTMLTranslator):
         if 'contents' in node['classes']:
             node.html_tagname = 'nav'
             node['classes'].remove('contents')
-            node['ids'].remove('contents')
+            # If the TOC has a title, the ID will be different, and in that
+            # case we'll leave it there.
+            if 'contents' in node['ids']: node['ids'].remove('contents')
         else:
             node.html_tagname = 'aside'
 
@@ -465,7 +468,7 @@ class SaneHtmlTranslator(HTMLTranslator):
     def depart_figure(self, node):
         # See depart_caption() below for details
         if self.in_figure_caption_with_description:
-            self.body.append('</span>\n</figcaption>\n')
+            self.body.append('</div>\n</figcaption>\n')
             self.in_figure_caption_with_description = False
         self.body.append('</figure>\n')
 
@@ -484,7 +487,7 @@ class SaneHtmlTranslator(HTMLTranslator):
         # such, figure out a way to query if there are useful nodes. Can't
         # check for just nodes.legend, as there can be arbitrary other stuff.
         if 'classes' in node.parent and 'm-figure' in node.parent['classes'] and node.next_node(descend=False, siblings=True) is not None:
-            self.body.append(self.starttag(node, 'span', CLASS='m-figure-description'))
+            self.body.append(self.starttag(node, 'div', CLASS='m-figure-description'))
             self.in_figure_caption_with_description = True
         else:
             self.body.append('</figcaption>\n')
